@@ -1,10 +1,9 @@
 # Hermes3D - 3D agent visualization for Hermes.
 # Multi-stage build: install prod deps -> build Next.js -> run with custom server.
 #
-# Node 22 is required: the runner ships next.config.ts without the `typescript`
-# devDependency, so Next auto-installs it at startup, which pulls in transitive
-# deps (e.g. camera-controls) that require Node >=22. On Node 20 that install
-# fails and the app crash-loops before ever binding to a port.
+# Node 22 is required by the current dependency graph. The runner also copies the
+# `typescript` devDependency from the builder so Next can load next.config.ts
+# immediately instead of installing development dependencies at container startup.
 
 FROM node:22-slim AS deps
 WORKDIR /app
@@ -32,11 +31,13 @@ LABEL org.opencontainers.image.source="https://github.com/iamlukethedev/Hermes3D
 LABEL org.opencontainers.image.description="Hermes3D — a 3D workspace for AI agents."
 LABEL org.opencontainers.image.licenses="MIT"
 
-# Copy built app + custom server + production node_modules only.
+# Copy built app + custom server + production node_modules. TypeScript is copied
+# explicitly because next.config.ts is transpiled when the server starts.
 COPY --from=builder /app/.next ./.next
 COPY --from=builder /app/public ./public
 COPY --from=builder /app/server ./server
 COPY --from=deps /app/node_modules ./node_modules
+COPY --from=builder /app/node_modules/typescript ./node_modules/typescript
 COPY --from=builder /app/package.json ./package.json
 COPY --from=builder /app/next.config.ts ./next.config.ts
 
