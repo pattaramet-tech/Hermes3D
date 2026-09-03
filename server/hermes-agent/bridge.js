@@ -532,14 +532,31 @@ function createHermesAgentUpstream(options) {
     return true;
   };
 
-  /** Load the fleet once per connection; a backend without profiles keeps one agent. */
+  /**
+   * Load the fleet once per connection.
+   *
+   * Newer hermes-agent builds expose `profiles.list` over JSON-RPC. Older
+   * production builds may only expose the authenticated REST profile API, so
+   * fall back to that before collapsing the office to one synthetic agent.
+   */
   const loadAgentRoster = async () => {
     try {
       const result = await client.request("profiles.list", {}, SESSION_RPC_TIMEOUT_MS);
       if (applyProfileRoster(result?.profiles)) return;
-      log("[hermes-agent] profiles.list returned nothing; using a single agent");
+      log("[hermes-agent] profiles.list returned nothing; trying profile REST API");
     } catch (err) {
-      log(`[hermes-agent] profiles.list unavailable (${errorMessage(err)}); using a single agent`);
+      log(`[hermes-agent] profiles.list unavailable (${errorMessage(err)}); trying profile REST API`);
+    }
+
+    try {
+      const profiles = await profileApi.listProfiles();
+      if (applyProfileRoster(profiles)) {
+        log("[hermes-agent] profile roster loaded through REST fallback");
+        return;
+      }
+      log("[hermes-agent] profile REST API returned nothing; using a single agent");
+    } catch (err) {
+      log(`[hermes-agent] profile REST API unavailable (${errorMessage(err)}); using a single agent`);
     }
   };
 

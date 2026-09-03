@@ -340,9 +340,26 @@ describe("profiles as agents", () => {
     expect(createCalls.at(-1)).toEqual({});
   });
 
-  it("falls back to a single agent when the backend has no profiles.list", async () => {
+  it("falls back to the REST profile API when the backend has no profiles.list", async () => {
     const agent = await startFakeHermesAgent({});
-    const bridge = await openBridge(agent.url);
+    const profileApi = {
+      listProfiles: async () => backendProfiles,
+    };
+    const bridge = await openBridge(agent.url, "", profileApi);
+    bridge.send({ type: "req", id: "c1", method: "connect", params: {} });
+    const res = await bridge.waitFor((f) => f.type === "res" && f.id === "c1", "hello-ok");
+    expect((at(res, "payload.snapshot.health.agents") as unknown[]).length).toBe(3);
+    expect(at(res, "payload.snapshot.health.defaultAgentId")).toBe("default");
+  });
+
+  it("falls back to a single agent when both profile discovery paths fail", async () => {
+    const agent = await startFakeHermesAgent({});
+    const profileApi = {
+      listProfiles: async () => {
+        throw new Error("REST profile API unavailable");
+      },
+    };
+    const bridge = await openBridge(agent.url, "", profileApi);
     bridge.send({ type: "req", id: "c1", method: "connect", params: {} });
     const res = await bridge.waitFor((f) => f.type === "res" && f.id === "c1", "hello-ok");
     expect((at(res, "payload.snapshot.health.agents") as unknown[]).length).toBe(1);
