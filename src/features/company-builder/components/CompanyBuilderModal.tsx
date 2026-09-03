@@ -15,6 +15,7 @@ type CompanyBuilderModalProps = {
   open: boolean;
   connected: boolean;
   agentCount: number;
+  preserveExistingAgents?: boolean;
   plannerAgentName: string | null;
   busy?: boolean;
   error?: string | null;
@@ -91,6 +92,7 @@ export function CompanyBuilderModal({
   open,
   connected,
   agentCount,
+  preserveExistingAgents = false,
   plannerAgentName,
   busy = false,
   error = null,
@@ -137,7 +139,7 @@ export function CompanyBuilderModal({
         promptDraft.trim() ||
         plan?.roles.length)
   );
-  const replacesExistingAgents = agentCount > 0;
+  const replacesExistingAgents = agentCount > 0 && !preserveExistingAgents;
 
   useEffect(() => {
     if (!plan || !pendingRoleScrollRef.current) return;
@@ -337,6 +339,11 @@ export function CompanyBuilderModal({
                     Your current {agentCount === 1 ? "agent will" : `${agentCount} agents will`} be
                     deleted and replaced by this company when you create it. This action is
                     irreversible and will delete the old agents&apos; workspaces.
+                  </div>
+                ) : null}
+                {preserveExistingAgents && agentCount > 0 ? (
+                  <div className="rounded-md border border-cyan-500/20 bg-cyan-500/10 px-3 py-2 text-xs leading-5 text-cyan-100/85">
+                    This runtime uses additive company creation. Your current {agentCount === 1 ? "agent" : `${agentCount} agents`} will be preserved and the new company roles will be added as separate profiles.
                   </div>
                 ) : null}
                 {!canUseAi ? (

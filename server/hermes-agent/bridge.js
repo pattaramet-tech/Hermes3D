@@ -18,6 +18,7 @@ const { EventEmitter } = require("node:events");
 const { randomUUID } = require("node:crypto");
 
 const { HermesAgentJsonRpcClient, redactUrl } = require("./jsonrpc-client");
+const { createHermesAgentProfileApi } = require("./profile-api");
 const { createOfficeSpeechSubscriber } = require("./office-speech");
 const {
   KANBAN_TASK_ID_PREFIX,
@@ -212,11 +213,60 @@ const resolveDefaultAgentId = (agents) => {
   return explicit?.id ?? agents[0]?.id ?? AGENT_ID;
 };
 
+const HERMES3D_ROLE_FILE_NAMES = [
+  "AGENTS.md",
+  "SOUL.md",
+  "IDENTITY.md",
+  "USER.md",
+  "TOOLS.md",
+  "HEARTBEAT.md",
+  "MEMORY.md",
+];
+
+const roleFileMarker = (name, side) => `<!-- HERMES3D_FILE:${name}:${side} -->`;
+
+const parseRoleFileBundle = (rawSoul) => {
+  const raw = typeof rawSoul === "string" ? rawSoul : "";
+  const bundle = new Map();
+  let foundManagedSection = false;
+  for (const name of HERMES3D_ROLE_FILE_NAMES) {
+    const begin = roleFileMarker(name, "BEGIN");
+    const end = roleFileMarker(name, "END");
+    const start = raw.indexOf(begin);
+    const stop = raw.indexOf(end);
+    if (start < 0 || stop < start) continue;
+    foundManagedSection = true;
+    bundle.set(name, raw.slice(start + begin.length, stop).trim());
+  }
+  if (!foundManagedSection && raw.trim()) {
+    bundle.set("SOUL.md", raw.trim());
+  }
+  return bundle;
+};
+
+const renderRoleFileBundle = (bundle) => {
+  const sections = HERMES3D_ROLE_FILE_NAMES
+    .filter((name) => bundle.has(name))
+    .map((name) => {
+      const content = String(bundle.get(name) ?? "").trim();
+      return [roleFileMarker(name, "BEGIN"), content, roleFileMarker(name, "END")].join("\n");
+    });
+  return [
+    "# Hermes3D Company Role",
+    "",
+    "This SOUL.md contains the role files managed by Hermes3D for this profile.",
+    "",
+    ...sections,
+    "",
+  ].join("\n");
+};
+
 function createHermesAgentUpstream(options) {
   const {
     url,
     token,
     handshakeTimeoutMs,
+    profileApi: suppliedProfileApi,
     log = () => {},
     logError = () => {},
   } = options || {};
@@ -236,6 +286,9 @@ function createHermesAgentUpstream(options) {
     upstream.terminate = () => {};
     return upstream;
   }
+
+  const profileApi = suppliedProfileApi || createHermesAgentProfileApi({ url, token });
+  const virtualRoleFiles = new Map();
 
   /** sessionKey -> { runtimeId, storedId, title } */
   const sessions = new Map();
@@ -470,21 +523,53 @@ function createHermesAgentUpstream(options) {
 
   // --- method dispatch ------------------------------------------------------
 
+  const applyProfileRoster = (profiles) => {
+    const mapped = toHermes3dAgents(profiles);
+    if (mapped.length === 0) return false;
+    agentRoster = mapped;
+    defaultAgentId = resolveDefaultAgentId(mapped);
+    log(`[hermes-agent] ${mapped.length} profile(s) mapped to agents: ${mapped.map((a) => a.id).join(", ")}`);
+    return true;
+  };
+
   /** Load the fleet once per connection; a backend without profiles keeps one agent. */
   const loadAgentRoster = async () => {
     try {
       const result = await client.request("profiles.list", {}, SESSION_RPC_TIMEOUT_MS);
-      const mapped = toHermes3dAgents(result?.profiles);
-      if (mapped.length > 0) {
-        agentRoster = mapped;
-        defaultAgentId = resolveDefaultAgentId(mapped);
-        log(`[hermes-agent] ${mapped.length} profile(s) mapped to agents: ${mapped.map((a) => a.id).join(", ")}`);
-        return;
-      }
+      if (applyProfileRoster(result?.profiles)) return;
       log("[hermes-agent] profiles.list returned nothing; using a single agent");
     } catch (err) {
       log(`[hermes-agent] profiles.list unavailable (${errorMessage(err)}); using a single agent`);
     }
+  };
+
+  /** Refresh after profile CRUD without requiring a second JSON-RPC method round trip. */
+  const refreshAgentRoster = async () => {
+    const profiles = await profileApi.listProfiles();
+    if (!applyProfileRoster(profiles)) {
+      throw new Error("hermes-agent profile API returned no profiles.");
+    }
+  };
+
+  const requireAgent = (agentId) => {
+    const resolved = agentRoster.find((agent) => agent.id === asString(agentId));
+    if (!resolved) throw new Error(`Unknown hermes-agent profile "${asString(agentId)}".`);
+    return resolved;
+  };
+
+  const loadRoleFiles = async (agentId) => {
+    if (virtualRoleFiles.has(agentId)) return virtualRoleFiles.get(agentId);
+    const agent = requireAgent(agentId);
+    const soul = await profileApi.getSoul(agent.id);
+    const bundle = parseRoleFileBundle(soul?.content);
+    virtualRoleFiles.set(agentId, bundle);
+    return bundle;
+  };
+
+  const persistRoleFiles = async (agentId, bundle) => {
+    const agent = requireAgent(agentId);
+    await profileApi.setSoul(agent.id, renderRoleFileBundle(bundle));
+    virtualRoleFiles.set(agentId, bundle);
   };
 
   /**
@@ -538,6 +623,9 @@ function createHermesAgentUpstream(options) {
       features: {
         methods: [
           "agents.list",
+          "agents.create",
+          "agents.update",
+          "agents.delete",
           "agents.files.get",
           "agents.files.set",
           "sessions.list",
@@ -590,19 +678,116 @@ function createHermesAgentUpstream(options) {
           })),
         });
 
-      case "agents.files.get":
-        return resOk(id, { file: { missing: true } });
+      case "agents.create": {
+        try {
+          const displayName = asString(p.name);
+          if (!displayName) return resErr(id, "hermes_agent.agent_name_required", "Agent name is required.");
+          const created = await profileApi.createProfile(displayName);
+          await refreshAgentRoster();
+          const agent = agentRoster.find((entry) => entry.id === created.name);
+          virtualRoleFiles.delete(created.name);
+          return resOk(id, {
+            ok: true,
+            agentId: created.name,
+            name: agent?.name || displayName,
+            workspace: agent?.workspace || created.path || "",
+          });
+        } catch (err) {
+          return resErr(id, "hermes_agent.agent_create_failed", errorMessage(err));
+        }
+      }
 
-      case "agents.files.set":
-        return resOk(id, {});
+      case "agents.update": {
+        try {
+          const agentId = asString(p.agentId);
+          const displayName = asString(p.name);
+          const agent = requireAgent(agentId);
+          if (agent.isDefault) {
+            return resErr(id, "hermes_agent.default_profile_immutable", "The default Hermes profile cannot be renamed.");
+          }
+          if (!displayName) return resErr(id, "hermes_agent.agent_name_required", "Agent name is required.");
+          const renamed = await profileApi.renameProfile(agent.id, displayName);
+          const existingFiles = virtualRoleFiles.get(agent.id);
+          if (existingFiles) {
+            virtualRoleFiles.delete(agent.id);
+            virtualRoleFiles.set(renamed.name, existingFiles);
+          }
+          await refreshAgentRoster();
+          return resOk(id, { ok: true, agentId: renamed.name, name: displayName });
+        } catch (err) {
+          return resErr(id, "hermes_agent.agent_update_failed", errorMessage(err));
+        }
+      }
 
-      case "config.get":
+      case "agents.delete": {
+        try {
+          const agentId = asString(p.agentId);
+          const agent = requireAgent(agentId);
+          if (agent.isDefault) {
+            return resErr(id, "hermes_agent.default_profile_immutable", "The default Hermes profile cannot be deleted.");
+          }
+          await profileApi.deleteProfile(agent.id);
+          virtualRoleFiles.delete(agent.id);
+          await refreshAgentRoster();
+          return resOk(id, { ok: true, removedBindings: 0 });
+        } catch (err) {
+          return resErr(id, "hermes_agent.agent_delete_failed", errorMessage(err));
+        }
+      }
+
+      case "agents.files.get": {
+        try {
+          const agentId = asString(p.agentId);
+          const name = asString(p.name);
+          if (!HERMES3D_ROLE_FILE_NAMES.includes(name)) {
+            return resErr(id, "hermes_agent.file_unsupported", `Unsupported agent file "${name}".`);
+          }
+          const agent = requireAgent(agentId);
+          const bundle = await loadRoleFiles(agent.id);
+          const content = bundle.get(name);
+          const workspace = agent.workspace || "";
+          return resOk(id, {
+            workspace,
+            file: {
+              missing: content === undefined,
+              content: content ?? "",
+              path: workspace ? `${workspace.replace(/[\\/]+$/, "")}/${name}` : null,
+            },
+          });
+        } catch (err) {
+          return resErr(id, "hermes_agent.file_read_failed", errorMessage(err));
+        }
+      }
+
+      case "agents.files.set": {
+        try {
+          const agentId = asString(p.agentId);
+          const name = asString(p.name);
+          if (!HERMES3D_ROLE_FILE_NAMES.includes(name)) {
+            return resErr(id, "hermes_agent.file_unsupported", `Unsupported agent file "${name}".`);
+          }
+          const bundle = new Map(await loadRoleFiles(agentId));
+          bundle.set(name, typeof p.content === "string" ? p.content : "");
+          await persistRoleFiles(agentId, bundle);
+          return resOk(id, { ok: true });
+        } catch (err) {
+          return resErr(id, "hermes_agent.file_write_failed", errorMessage(err));
+        }
+      }
+
+      case "config.get": {
+        const defaultAgent = agentRoster.find((agent) => agent.id === defaultAgentId) ?? agentRoster[0];
+        const workspace = asString(defaultAgent?.workspace);
+        const configPath = workspace
+          ? `${workspace.replace(/[\\/]+$/, "")}/config.yaml`
+          : "/tmp/hermes-agent/config.yaml";
         return resOk(id, {
           config: { gateway: { reload: { mode: "hot" } } },
           hash: "hermes-agent",
           exists: true,
-          path: "",
+          path: configPath,
         });
+      }
 
       case "config.patch":
       case "config.set":

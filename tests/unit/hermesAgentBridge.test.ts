@@ -74,9 +74,9 @@ const startFakeHermesAgent = async (handlers: Record<string, RpcHandler>) => {
 };
 
 /** Drive the bridge and collect the frames it sends back toward the browser. */
-const openBridge = async (url: string, token = "") => {
+const openBridge = async (url: string, token = "", profileApi?: unknown) => {
   const frames: Frame[] = [];
-  const upstream = createHermesAgentUpstream({ url, token });
+  const upstream = createHermesAgentUpstream({ url, token, ...(profileApi ? { profileApi } : {}) });
   upstreams.push(upstream);
   upstream.on("message", (raw: string) => frames.push(JSON.parse(raw) as Frame));
 
@@ -456,6 +456,92 @@ describe("hermes-agent bridge", () => {
     expect(at(res, "payload.type")).toBe("hello-ok");
     expect(at(res, "payload.snapshot.health.agents")).toHaveLength(1);
     expect(at(res, "payload.snapshot.health.defaultAgentId")).toBe("hermes");
+  });
+
+  it("manages hermes-agent profiles and persists virtual role files without touching default profiles", async () => {
+    let profiles = [
+      { name: "default", display_name: "Default", is_default: true, path: "/home/hermes/.hermes" },
+      { name: "partner", display_name: "Partner", is_default: false, path: "/home/hermes/.hermes/profiles/partner" },
+    ];
+    const souls = new Map<string, string>([["partner", "Partner soul"]]);
+    const profileApi = {
+      listProfiles: async () => profiles,
+      createProfile: async (displayName: string) => {
+        const name = displayName.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, "-");
+        const path = `/home/hermes/.hermes/profiles/${name}`;
+        profiles = [...profiles, { name, display_name: displayName, is_default: false, path }];
+        souls.set(name, "");
+        return { name, path };
+      },
+      renameProfile: async (name: string, displayName: string) => {
+        const nextName = displayName.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, "-");
+        profiles = profiles.map((profile) =>
+          profile.name === name ? { ...profile, name: nextName, display_name: displayName } : profile,
+        );
+        souls.set(nextName, souls.get(name) ?? "");
+        souls.delete(name);
+        return { name: nextName, path: `/home/hermes/.hermes/profiles/${nextName}` };
+      },
+      deleteProfile: async (name: string) => {
+        profiles = profiles.filter((profile) => profile.name !== name);
+        souls.delete(name);
+        return { ok: true };
+      },
+      getSoul: async (name: string) => ({ content: souls.get(name) ?? "", exists: souls.has(name) }),
+      setSoul: async (name: string, content: string) => {
+        souls.set(name, content);
+        return { ok: true };
+      },
+    };
+    const agent = await startFakeHermesAgent({
+      "profiles.list": () => ({ profiles }),
+    });
+    const bridge = await openBridge(agent.url, "", profileApi);
+
+    bridge.send({ type: "req", id: "c-profile", method: "connect", params: {} });
+    await bridge.waitFor((f) => f.type === "res" && f.id === "c-profile", "profile connect");
+
+    bridge.send({ type: "req", id: "create-editor", method: "agents.create", params: { name: "Editor" } });
+    const created = await bridge.waitFor(
+      (f) => f.type === "res" && f.id === "create-editor",
+      "agents.create",
+    );
+    expect(created.ok).toBe(true);
+    expect(at(created, "payload.agentId")).toBe("editor");
+
+    bridge.send({
+      type: "req",
+      id: "write-editor",
+      method: "agents.files.set",
+      params: { agentId: "editor", name: "AGENTS.md", content: "Editor responsibilities" },
+    });
+    const written = await bridge.waitFor((f) => f.type === "res" && f.id === "write-editor", "file write");
+    expect(written.ok).toBe(true);
+    expect(souls.get("editor")).toContain("HERMES3D_FILE:AGENTS.md:BEGIN");
+    expect(souls.get("editor")).toContain("Editor responsibilities");
+
+    bridge.send({
+      type: "req",
+      id: "read-editor",
+      method: "agents.files.get",
+      params: { agentId: "editor", name: "AGENTS.md" },
+    });
+    const read = await bridge.waitFor((f) => f.type === "res" && f.id === "read-editor", "file read");
+    expect(at(read, "payload.file.content")).toBe("Editor responsibilities");
+
+    bridge.send({ type: "req", id: "delete-default", method: "agents.delete", params: { agentId: "default" } });
+    const protectedDefault = await bridge.waitFor(
+      (f) => f.type === "res" && f.id === "delete-default",
+      "default delete refusal",
+    );
+    expect(protectedDefault.ok).toBe(false);
+    expect(at(protectedDefault, "error.code")).toBe("hermes_agent.default_profile_immutable");
+
+    bridge.send({ type: "req", id: "delete-editor", method: "agents.delete", params: { agentId: "editor" } });
+    const deleted = await bridge.waitFor((f) => f.type === "res" && f.id === "delete-editor", "agents.delete");
+    expect(deleted.ok).toBe(true);
+    expect(profiles.map((profile) => profile.name)).toEqual(["default", "partner"]);
+    expect(souls.get("partner")).toBe("Partner soul");
   });
 
   it("turns chat.send into prompt.submit and streams deltas into chat events", async () => {

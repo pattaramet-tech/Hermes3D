@@ -1841,6 +1841,7 @@ export function OfficeScreen({
           input: params.input,
           plan: params.plan,
           existingAgentIds,
+          preserveExistingAgents: activeAdapterType === "hermes-agent",
           deleteExistingAgent: async (agentId) => {
             try {
               await deleteAgentViaStudio({
@@ -1932,6 +1933,7 @@ export function OfficeScreen({
       }
     },
     [
+      activeAdapterType,
       clearDeletedAgentUiState,
       client,
       dispatch,
@@ -5597,6 +5599,7 @@ export function OfficeScreen({
         open={companyBuilderOpen}
         connected={status === "connected"}
         agentCount={state.agents.length}
+        preserveExistingAgents={activeAdapterType === "hermes-agent"}
         plannerAgentName={plannerAgent?.name ?? null}
         busy={companyBuilderBusy}
         error={companyBuilderError}

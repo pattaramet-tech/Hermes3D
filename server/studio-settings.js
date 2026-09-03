@@ -66,16 +66,37 @@ const readHermesGatewayDefaults = (env = process.env) => {
   }
 };
 
+const readEnvGatewayDefaults = (env = process.env) => {
+  const url =
+    typeof env.HERMES3D_GATEWAY_URL === "string" ? env.HERMES3D_GATEWAY_URL.trim() : "";
+  if (!url) return null;
+  const token =
+    typeof env.HERMES3D_GATEWAY_TOKEN === "string" ? env.HERMES3D_GATEWAY_TOKEN.trim() : "";
+  const adapterType =
+    typeof env.HERMES3D_GATEWAY_ADAPTER_TYPE === "string" &&
+    env.HERMES3D_GATEWAY_ADAPTER_TYPE.trim()
+      ? env.HERMES3D_GATEWAY_ADAPTER_TYPE.trim()
+      : "hermes";
+  return { url, token, adapterType };
+};
+
 const loadUpstreamGatewaySettings = (env = process.env) => {
   const settingsPath = resolveStudioSettingsPath(env);
   const parsed = readJsonFile(settingsPath);
   const gateway = parsed && typeof parsed === "object" ? parsed.gateway : null;
-  const url = typeof gateway?.url === "string" ? gateway.url.trim() : "";
-  const token = typeof gateway?.token === "string" ? gateway.token.trim() : "";
+  const envDefaults = readEnvGatewayDefaults(env);
+  const url =
+    typeof gateway?.url === "string" && gateway.url.trim()
+      ? gateway.url.trim()
+      : envDefaults?.url ?? "";
+  const token =
+    typeof gateway?.token === "string" && gateway.token.trim()
+      ? gateway.token.trim()
+      : envDefaults?.token ?? "";
   const adapterType =
     typeof gateway?.adapterType === "string" && gateway.adapterType.trim()
       ? gateway.adapterType.trim()
-      : "hermes";
+      : envDefaults?.adapterType ?? "hermes";
   if (!token && adapterType === "hermes") {
     const defaults = readHermesGatewayDefaults(env);
     if (defaults) {
