@@ -641,11 +641,17 @@ function createHermesAgentUpstream(options) {
 
   // --- method dispatch ------------------------------------------------------
 
+  // This cache is only a validated snapshot from cron.list, keyed by canonical
+  // native job ID. It is never treated as proof authorizing a mutation because
+  // profiles and jobs can change outside this bridge between requests.
+  const cronAgentByJobId = new Map();
+
   const applyProfileRoster = (profiles) => {
     const mapped = toHermes3dAgents(profiles);
     if (mapped.length === 0) return false;
     agentRoster = mapped;
     defaultAgentId = resolveDefaultAgentId(mapped);
+    cronAgentByJobId.clear();
     log(`[hermes-agent] ${mapped.length} profile(s) mapped to agents: ${mapped.map((a) => a.id).join(", ")}`);
     return true;
   };
@@ -686,20 +692,12 @@ function createHermesAgentUpstream(options) {
     }
   };
 
-  const cronAgentByJobId = new Map();
-
   const resolveCronAgent = async (agentId, jobId) => {
     const requested = asString(agentId);
     const reference = asString(jobId);
     if (requested) {
       const agent = requireAgent(requested);
       if (!reference) return agent;
-
-      const known = cronAgentByJobId.get(reference);
-      if (known && known.id !== agent.id) {
-        throw new Error(`Cron job "${reference}" belongs to agent "${known.id}", not "${agent.id}".`);
-      }
-      if (known) return agent;
 
       // Do not trust a caller-supplied agentId for an existing job. Verify the
       // reference in that profile before mutating it; otherwise a stale UI can
@@ -712,39 +710,34 @@ function createHermesAgentUpstream(options) {
       });
       if (matches.length === 0) throw new Error(`Unknown cron job "${reference}" for agent "${agent.id}".`);
       if (matches.length > 1) throw new Error(`Ambiguous cron job reference "${reference}" for agent "${agent.id}".`);
-      cronAgentByJobId.set(reference, agent);
       return agent;
     }
     if (!reference) return requireAgent(defaultAgentId);
-    const known = cronAgentByJobId.get(reference);
-    if (known) return known;
 
     // A fresh browser can act on a job before it has rendered cron.list. Find
-    // the owner rather than defaulting to the launch profile. Multiple owners
-    // are an integrity error, not permission to pick the first one.
-    const candidates = await Promise.all(
+    // the owner rather than defaulting to the launch profile. Every profile
+    // must be readable before ownership can be proven; partial evidence must
+    // never authorize a mutation.
+    const scans = await Promise.all(
       agentRoster.map(async (agent) => {
-        try {
-          const jobs = await listCronJobsForAgent(agent, true);
-          return jobs.some((job) => {
-            const id = asString(job?.job_id || job?.id);
-            return id === reference || asString(job?.name) === reference;
-          })
-            ? agent
-            : undefined;
-        } catch {
-          return undefined;
-        }
+        const jobs = await listCronJobsForAgent(agent, true);
+        return { agent, jobs };
       }),
     );
-    const owners = candidates.filter(Boolean);
-    if (owners.length > 1) {
+    const matches = scans.flatMap(({ agent, jobs }) =>
+      jobs
+        .filter((job) => {
+          const id = asString(job?.job_id || job?.id);
+          return id === reference || asString(job?.name) === reference;
+        })
+        .map((job) => ({ agent, job })),
+    );
+    if (matches.length > 1) {
       throw new Error(`Ambiguous cron job ownership for "${reference}".`);
     }
-    const resolved = owners[0];
+    const resolved = matches[0];
     if (!resolved) throw new Error(`Unknown cron job "${reference}".`);
-    cronAgentByJobId.set(reference, resolved);
-    return resolved;
+    return resolved.agent;
   };
 
   const requireAgent = (agentId) => {
@@ -1396,24 +1389,21 @@ function createHermesAgentUpstream(options) {
             }),
           );
           const flattened = perAgent.flat();
-          const owners = new Map();
+          cronAgentByJobId.clear();
           for (const job of flattened) {
-            const previous = owners.get(job.id);
-            if (previous && previous !== job.agentId) {
+            const previous = cronAgentByJobId.get(job.id);
+            if (previous && previous.id !== job.agentId) {
               throw new Error(`Ambiguous cron job ownership for "${job.id}".`);
             }
             if (previous) {
               throw new Error(`Duplicate cron job id "${job.id}" in agent "${job.agentId}".`);
             }
-            owners.set(job.id, job.agentId);
-          }
-          cronAgentByJobId.clear();
-          for (const job of flattened) {
             const owner = agentRoster.find((agent) => agent.id === job.agentId);
             if (owner) cronAgentByJobId.set(job.id, owner);
           }
           return resOk(id, { jobs: flattened });
         } catch (err) {
+          cronAgentByJobId.clear();
           return resErr(id, "hermes_agent.cron_list_failed", errorMessage(err));
         }
       }
@@ -1449,9 +1439,9 @@ function createHermesAgentUpstream(options) {
           const mappedJob = rawJob
             ? toHermes3dCronJobs([rawJob], agent.id)[0]
             : undefined;
-          if (mappedJob?.id) cronAgentByJobId.set(mappedJob.id, agent);
           if (action === "remove") {
-            cronAgentByJobId.delete(asString(p.id));
+            // The request may have used a job name instead of its canonical ID.
+            cronAgentByJobId.clear();
             return resOk(id, { ok: true, removed: true });
           }
           if (action === "run") {

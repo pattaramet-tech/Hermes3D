@@ -585,8 +585,13 @@ describe("native cron bridge", () => {
       { method: "GET", path: "/api/cron/jobs?profile=default&include_disabled=false" },
       { method: "GET", path: "/api/cron/jobs?profile=coordinator&include_disabled=false" },
       { method: "POST", path: "/api/cron/jobs?profile=coordinator" },
+      { method: "GET", path: "/api/cron/jobs?profile=coordinator" },
       { method: "PUT", path: "/api/cron/jobs/coordinator-job?profile=coordinator" },
+      { method: "GET", path: "/api/cron/jobs?profile=default" },
+      { method: "GET", path: "/api/cron/jobs?profile=coordinator" },
       { method: "POST", path: "/api/cron/jobs/coordinator-job/trigger?profile=coordinator" },
+      { method: "GET", path: "/api/cron/jobs?profile=default" },
+      { method: "GET", path: "/api/cron/jobs?profile=coordinator" },
       { method: "DELETE", path: "/api/cron/jobs/coordinator-job?profile=coordinator" },
     ]);
     expect(rest.requests[2].body).toEqual({
@@ -595,7 +600,7 @@ describe("native cron bridge", () => {
       prompt: "Do work",
       deliver: "local",
     });
-    expect(rest.requests[3].body).toEqual({ updates: { name: "Updated job", prompt: "Updated event" } });
+    expect(rest.requests[4].body).toEqual({ updates: { name: "Updated job", prompt: "Updated event" } });
   });
 
   it("rejects invalid create and update payloads before contacting REST", async () => {
@@ -752,6 +757,157 @@ describe("native cron bridge", () => {
     const frame = await bridge.waitFor((f) => f.type === "res" && f.id === "l1", "cron.list");
     expect(at(frame, "error.code")).toBe("hermes_agent.cron_list_failed");
     expect(String(at(frame, "error.message"))).toContain("Ambiguous cron job ownership");
+  });
+
+  it("fails closed when an unscoped ownership scan has incomplete profile evidence", async () => {
+    const triggerCalls: string[] = [];
+    const agent = await startFakeHermesAgent({
+      "profiles.list": () => ({
+        profiles: [
+          { name: "default", is_default: true, path: "/home/hermes/.hermes" },
+          { name: "coordinator", is_default: false, path: "/home/hermes/.hermes/profiles/coordinator" },
+        ],
+      }),
+    });
+    const profileApi = {
+      listCronJobs: async (profile: string) => {
+        if (profile === "default") throw new Error("default profile unreadable");
+        return [{ job_id: "target-job", name: "Target", schedule: "every 1h", prompt: "Work" }];
+      },
+      triggerCronJob: async (profile: string) => {
+        triggerCalls.push(profile);
+        return { job_id: "target-job", name: "Target", schedule: "every 1h", prompt: "Work" };
+      },
+    };
+    const bridge = await openBridge(agent.url, "", profileApi);
+    bridge.send({ type: "req", id: "c1", method: "connect", params: {} });
+    await bridge.waitFor((f) => f.type === "res" && f.id === "c1", "hello-ok");
+
+    bridge.send({ type: "req", id: "r1", method: "cron.run", params: { id: "target-job" } });
+    const frame = await bridge.waitFor((f) => f.type === "res" && f.id === "r1", "cron.run");
+    expect(at(frame, "error.code")).toBe("hermes_agent.cron_run_failed");
+    expect(String(at(frame, "error.message"))).toContain("default profile unreadable");
+    expect(triggerCalls).toEqual([]);
+  });
+
+  it("does not let an explicitly scoped name cache bias a later unscoped mutation", async () => {
+    const updateCalls: string[] = [];
+    const triggerCalls: string[] = [];
+    const agent = await startFakeHermesAgent({
+      "profiles.list": () => ({
+        profiles: [
+          { name: "default", is_default: true, path: "/home/hermes/.hermes" },
+          { name: "coordinator", is_default: false, path: "/home/hermes/.hermes/profiles/coordinator" },
+        ],
+      }),
+    });
+    const profileApi = {
+      listCronJobs: async (profile: string) => [
+        {
+          job_id: `${profile}-job`,
+          name: "Shared name",
+          schedule: "every 1h",
+          prompt: "Work",
+        },
+      ],
+      updateCronJob: async (profile: string) => {
+        updateCalls.push(profile);
+        return { job_id: `${profile}-job`, name: "Shared name", schedule: "every 1h", prompt: "Work" };
+      },
+      triggerCronJob: async (profile: string) => {
+        triggerCalls.push(profile);
+        return { job_id: `${profile}-job`, name: "Shared name", schedule: "every 1h", prompt: "Work" };
+      },
+    };
+    const bridge = await openBridge(agent.url, "", profileApi);
+    bridge.send({ type: "req", id: "c1", method: "connect", params: {} });
+    await bridge.waitFor((f) => f.type === "res" && f.id === "c1", "hello-ok");
+
+    bridge.send({
+      type: "req",
+      id: "u1",
+      method: "cron.update",
+      params: { agentId: "default", id: "Shared name", name: "Shared name" },
+    });
+    const updated = await bridge.waitFor((f) => f.type === "res" && f.id === "u1", "cron.update");
+    expect(updated.ok).toBe(true);
+    expect(updateCalls).toEqual(["default"]);
+
+    bridge.send({ type: "req", id: "r1", method: "cron.run", params: { id: "Shared name" } });
+    const frame = await bridge.waitFor((f) => f.type === "res" && f.id === "r1", "cron.run");
+    expect(at(frame, "error.code")).toBe("hermes_agent.cron_run_failed");
+    expect(String(at(frame, "error.message"))).toContain("Ambiguous cron job ownership");
+    expect(triggerCalls).toEqual([]);
+  });
+
+  it("invalidates cached ownership when the profile roster is renamed or deleted", async () => {
+    let profiles = [
+      { name: "default", display_name: "Default", is_default: true, path: "/home/hermes/.hermes" },
+      { name: "coordinator", display_name: "Coordinator", is_default: false, path: "/home/hermes/.hermes/profiles/coordinator" },
+    ];
+    const triggerCalls: string[] = [];
+    const agent = await startFakeHermesAgent({
+      "profiles.list": () => ({ profiles }),
+    });
+    const profileApi = {
+      listProfiles: async () => profiles,
+      renameProfile: async () => {
+        profiles = profiles.map((profile) =>
+          profile.name === "coordinator"
+            ? { ...profile, name: "dispatcher", display_name: "Dispatcher", path: "/home/hermes/.hermes/profiles/dispatcher" }
+            : profile,
+        );
+        return { name: "dispatcher", path: "/home/hermes/.hermes/profiles/dispatcher" };
+      },
+      deleteProfile: async (name: string) => {
+        profiles = profiles.filter((profile) => profile.name !== name);
+        return { ok: true };
+      },
+      listCronJobs: async (profile: string) =>
+        profile === "default"
+          ? []
+          : [{ job_id: "coordinator-job", name: "Coordinator job", schedule: "every 1h", prompt: "Work" }],
+      triggerCronJob: async (profile: string) => {
+        triggerCalls.push(profile);
+        return { job_id: "coordinator-job", name: "Coordinator job", schedule: "every 1h", prompt: "Work" };
+      },
+    };
+    const bridge = await openBridge(agent.url, "", profileApi);
+    bridge.send({ type: "req", id: "c1", method: "connect", params: {} });
+    await bridge.waitFor((f) => f.type === "res" && f.id === "c1", "hello-ok");
+
+    bridge.send({ type: "req", id: "l1", method: "cron.list", params: {} });
+    const listed = await bridge.waitFor((f) => f.type === "res" && f.id === "l1", "cron.list");
+    expect(listed.ok).toBe(true);
+
+    bridge.send({
+      type: "req",
+      id: "rename",
+      method: "agents.update",
+      params: { agentId: "coordinator", name: "Dispatcher" },
+    });
+    const renamed = await bridge.waitFor((f) => f.type === "res" && f.id === "rename", "agents.update");
+    expect(renamed.ok).toBe(true);
+
+    bridge.send({ type: "req", id: "r1", method: "cron.run", params: { id: "coordinator-job" } });
+    const ran = await bridge.waitFor((f) => f.type === "res" && f.id === "r1", "cron.run");
+    expect(ran.ok).toBe(true);
+    expect(triggerCalls).toEqual(["dispatcher"]);
+
+    bridge.send({
+      type: "req",
+      id: "delete",
+      method: "agents.delete",
+      params: { agentId: "dispatcher" },
+    });
+    const deleted = await bridge.waitFor((f) => f.type === "res" && f.id === "delete", "agents.delete");
+    expect(deleted.ok).toBe(true);
+
+    bridge.send({ type: "req", id: "r2", method: "cron.run", params: { id: "coordinator-job" } });
+    const missing = await bridge.waitFor((f) => f.type === "res" && f.id === "r2", "cron.run deleted");
+    expect(at(missing, "error.code")).toBe("hermes_agent.cron_run_failed");
+    expect(String(at(missing, "error.message"))).toContain('Unknown cron job "coordinator-job"');
+    expect(triggerCalls).toEqual(["dispatcher"]);
   });
 
   it("preserves semantic backend failures for profile-scoped mutations", async () => {
