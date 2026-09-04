@@ -34,6 +34,8 @@ const profileNameFromDisplay = (value) => {
 };
 
 const encodeProfile = (name) => encodeURIComponent(String(name ?? "").trim());
+const cronProfile = (name) => encodeURIComponent(String(name || "default").trim() || "default");
+const cronPath = (name, suffix = "") => `/api/cron/jobs${suffix}?profile=${cronProfile(name)}`;
 
 const requestJson = ({ baseUrl, token, method, path, body }) => {
   const base = resolveHttpBaseUrl(baseUrl);
@@ -153,6 +155,80 @@ const createHermesAgentProfileApi = ({ url, token }) => ({
       method: "PUT",
       path: `/api/profiles/${encodeProfile(name)}/soul`,
       body: { content: String(content ?? "") },
+    });
+  },
+
+  async listCronJobs(profile = "default", includeDisabled = true) {
+    const suffix = includeDisabled === false ? "&include_disabled=false" : "";
+    const result = await requestJson({
+      baseUrl: url,
+      token,
+      method: "GET",
+      path: `${cronPath(profile)}${suffix}`,
+    });
+    if (result?.success === false || result?.ok === false) {
+      const semanticError =
+        (typeof result?.error?.message === "string" && result.error.message) ||
+        (typeof result?.error === "string" && result.error) ||
+        (typeof result?.message === "string" && result.message);
+      throw new Error(semanticError || "Hermes cron list failed.");
+    }
+    return Array.isArray(result) ? result : Array.isArray(result?.jobs) ? result.jobs : [];
+  },
+
+  async createCronJob(profile, job) {
+    return requestJson({
+      baseUrl: url,
+      token,
+      method: "POST",
+      path: cronPath(profile),
+      body: job,
+    });
+  },
+
+  async updateCronJob(profile, jobId, updates) {
+    return requestJson({
+      baseUrl: url,
+      token,
+      method: "PUT",
+      path: cronPath(profile, `/${encodeURIComponent(String(jobId))}`),
+      body: { updates },
+    });
+  },
+
+  async pauseCronJob(profile, jobId) {
+    return requestJson({
+      baseUrl: url,
+      token,
+      method: "POST",
+      path: cronPath(profile, `/${encodeURIComponent(String(jobId))}/pause`),
+    });
+  },
+
+  async resumeCronJob(profile, jobId) {
+    return requestJson({
+      baseUrl: url,
+      token,
+      method: "POST",
+      path: cronPath(profile, `/${encodeURIComponent(String(jobId))}/resume`),
+    });
+  },
+
+  async triggerCronJob(profile, jobId) {
+    return requestJson({
+      baseUrl: url,
+      token,
+      method: "POST",
+      path: cronPath(profile, `/${encodeURIComponent(String(jobId))}/trigger`),
+    });
+  },
+
+  async deleteCronJob(profile, jobId) {
+    return requestJson({
+      baseUrl: url,
+      token,
+      method: "DELETE",
+      path: cronPath(profile, `/${encodeURIComponent(String(jobId))}`),
     });
   },
 });

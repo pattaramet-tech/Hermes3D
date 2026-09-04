@@ -90,6 +90,25 @@ const DURATION_UNIT_MS = { s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 };
  * timestamp for a one-shot job.
  */
 const toHermes3dSchedule = (raw) => {
+  if (raw && typeof raw === "object") {
+    const kind = asString(raw.kind).toLowerCase();
+    if (kind === "every" && Number.isFinite(Number(raw.everyMs))) {
+      return { kind: "every", everyMs: Number(raw.everyMs) };
+    }
+    if (kind === "at" && asString(raw.at)) {
+      return { kind: "at", at: asString(raw.at) };
+    }
+    if (kind === "cron" && asString(raw.expr)) {
+      return { kind: "cron", expr: asString(raw.expr) };
+    }
+    if (kind === "interval" && Number.isFinite(Number(raw.minutes))) {
+      return { kind: "every", everyMs: Number(raw.minutes) * 60_000 };
+    }
+    if (kind === "once" && asString(raw.run_at)) {
+      return { kind: "at", at: asString(raw.run_at) };
+    }
+    raw = raw.display || raw.value || raw.expr || raw.run_at;
+  }
   const value = asString(raw);
   if (!value) return { kind: "cron", expr: "" };
 
@@ -97,6 +116,14 @@ const toHermes3dSchedule = (raw) => {
   if (duration) {
     const unit = DURATION_UNIT_MS[duration[2].toLowerCase()];
     if (unit) return { kind: "every", everyMs: Number(duration[1]) * unit };
+  }
+
+  // The REST API may return the human-readable one-shot form while retaining
+  // the structured run_at value in `schedule`; do not mistake it for cron.
+  const once = /^once\s+(?:in|at)\s+(.+)$/i.exec(value);
+  if (once) {
+    const timestamp = parseTimestampMs(once[1]);
+    if (timestamp !== undefined) return { kind: "at", at: once[1] };
   }
 
   if (value.split(/\s+/).length === 5) return { kind: "cron", expr: value };
@@ -108,6 +135,97 @@ const toHermes3dSchedule = (raw) => {
 };
 
 const CRON_STATUSES = new Set(["ok", "error", "skipped"]);
+
+/**
+ * Convert Hermes3D's tagged schedule union to the string accepted by the
+ * native hermes cron tool. The native runner owns parsing, validation, and
+ * persistence; the bridge only translates the wire shape.
+ */
+const toNativeCronSchedule = (schedule) => {
+  if (!schedule || typeof schedule !== "object") {
+    throw new Error("Cron schedule is required.");
+  }
+  if (schedule.kind === "at") {
+    const value = asString(schedule.at);
+    if (!value) throw new Error("Cron run time is required.");
+    return value;
+  }
+  if (schedule.kind === "cron") {
+    const value = asString(schedule.expr);
+    if (!value) throw new Error("Cron expression is required.");
+    return value;
+  }
+  if (schedule.kind === "every") {
+    const everyMs = Number(schedule.everyMs);
+    if (!Number.isFinite(everyMs) || everyMs <= 0 || everyMs % 60_000 !== 0) {
+      throw new Error("Native Hermes Cron supports intervals in whole minutes.");
+    }
+    return `every ${everyMs / 60_000}m`;
+  }
+  throw new Error(`Unsupported cron schedule kind "${asString(schedule.kind)}".`);
+};
+
+/** Hermes3D delivery object from the native runner's delivery string. */
+const toHermes3dDelivery = (raw) => {
+  const value = Array.isArray(raw) ? raw.map((item) => asString(item)).filter(Boolean).join(",") : asString(raw);
+  if (!value || value.toLowerCase() === "local" || value.toLowerCase() === "none") {
+    return { mode: "none" };
+  }
+  const separator = value.indexOf(":");
+  const channel = separator === -1 ? value : value.slice(0, separator);
+  const to = separator === -1 ? "" : value.slice(separator + 1);
+  return {
+    mode: "announce",
+    channel,
+    ...(to ? { to } : {}),
+  };
+};
+
+/** Native cron uses one delivery string rather than Hermes3D's tagged object. */
+const toNativeCronDelivery = (delivery) => {
+  if (!delivery || delivery.mode === "none") return "local";
+  const channel = asString(delivery.channel);
+  const to = asString(delivery.to);
+  if (!channel || channel === "local" || channel === "none" || channel === "last") {
+    return to ? `origin:${to}` : "origin";
+  }
+  return to ? `${channel}:${to}` : channel;
+};
+
+const cronPayloadText = (payload, required = false) => {
+  if (!payload || typeof payload !== "object") {
+    if (required) throw new Error("Cron payload is required.");
+    return "";
+  }
+  const kind = asString(payload.kind);
+  if (kind !== "agentTurn" && kind !== "systemEvent") {
+    throw new Error(`Unsupported cron payload kind "${kind || "unknown"}".`);
+  }
+  const text = asString(kind === "systemEvent" ? payload.text : payload.message);
+  if (!text) throw new Error("Cron payload text must be non-empty.");
+  return text;
+};
+
+/**
+ * Build the profile-scoped payload for the native cron runner.
+ *
+ * `profile` is deliberately omitted for the default agent: on hermes-agent an
+ * omitted profile means the gateway's launch profile. Named profiles must be
+ * explicit or jobs silently land in the wrong scheduler/home.
+ */
+const toNativeCronParams = (params, agent, action) => {
+  const profile = asString(agent?.profile);
+  const scope = profile ? { profile } : {};
+  const result = { action, ...scope };
+  if (params?.name !== undefined) result.name = asString(params.name);
+  if (params?.jobId !== undefined) result.name = asString(params.jobId);
+  if (params?.schedule !== undefined) result.schedule = toNativeCronSchedule(params.schedule);
+  if (params?.payload !== undefined) result.prompt = cronPayloadText(params.payload);
+  if (params?.delivery !== undefined) result.deliver = toNativeCronDelivery(params.delivery);
+  if (params?.repeat !== undefined) result.repeat = params.repeat;
+  if (params?.includeDisabled !== undefined) result.include_disabled = Boolean(params.includeDisabled);
+  return result;
+};
 
 /**
  * Translate hermes-agent cron rows into Hermes3D's `CronJobSummary`.
@@ -128,16 +246,16 @@ const toHermes3dCronJobs = (jobs, agentId = AGENT_ID) => {
       const lastStatus = asString(job.last_status).toLowerCase();
       const lastError = asString(job.last_fire_error) || asString(job.last_delivery_error);
       const message =
-        asString(job.prompt_preview) || asString(job.name) || "Scheduled job";
+        asString(job.prompt_preview) || asString(job.prompt) || asString(job.name) || "Scheduled job";
 
       return {
         id: asString(job.job_id) || asString(job.id),
         name: asString(job.name) || asString(job.job_id) || "Scheduled job",
         agentId,
-        description: asString(job.prompt_preview) || undefined,
+        description: asString(job.prompt_preview) || asString(job.prompt) || undefined,
         enabled: job.enabled !== false,
         updatedAtMs: lastRunAtMs ?? nextRunAtMs ?? Date.now(),
-        schedule: toHermes3dSchedule(job.schedule),
+        schedule: toHermes3dSchedule(job.schedule ?? job.schedule_display),
         sessionTarget: "isolated",
         wakeMode: "next-heartbeat",
         payload: { kind: "agentTurn", message },
@@ -150,7 +268,7 @@ const toHermes3dCronJobs = (jobs, agentId = AGENT_ID) => {
           ...(CRON_STATUSES.has(lastStatus) ? { lastStatus } : {}),
           ...(lastError ? { lastError } : {}),
         },
-        delivery: { mode: asString(job.deliver) && job.deliver !== "none" ? "announce" : "none" },
+        delivery: toHermes3dDelivery(job.deliver),
       };
     })
     .filter((job) => job.id);
@@ -568,10 +686,234 @@ function createHermesAgentUpstream(options) {
     }
   };
 
+  const cronAgentByJobId = new Map();
+
+  const resolveCronAgent = async (agentId, jobId) => {
+    const requested = asString(agentId);
+    const reference = asString(jobId);
+    if (requested) {
+      const agent = requireAgent(requested);
+      if (!reference) return agent;
+
+      const known = cronAgentByJobId.get(reference);
+      if (known && known.id !== agent.id) {
+        throw new Error(`Cron job "${reference}" belongs to agent "${known.id}", not "${agent.id}".`);
+      }
+      if (known) return agent;
+
+      // Do not trust a caller-supplied agentId for an existing job. Verify the
+      // reference in that profile before mutating it; otherwise a stale UI can
+      // accidentally target the launch profile (or a different profile).
+      const rows = await listCronJobsForAgent(agent, true);
+      const matches = rows.filter((job) => {
+        const id = asString(job?.job_id || job?.id);
+        const name = asString(job?.name);
+        return id === reference || name === reference;
+      });
+      if (matches.length === 0) throw new Error(`Unknown cron job "${reference}" for agent "${agent.id}".`);
+      if (matches.length > 1) throw new Error(`Ambiguous cron job reference "${reference}" for agent "${agent.id}".`);
+      cronAgentByJobId.set(reference, agent);
+      return agent;
+    }
+    if (!reference) return requireAgent(defaultAgentId);
+    const known = cronAgentByJobId.get(reference);
+    if (known) return known;
+
+    // A fresh browser can act on a job before it has rendered cron.list. Find
+    // the owner rather than defaulting to the launch profile. Multiple owners
+    // are an integrity error, not permission to pick the first one.
+    const candidates = await Promise.all(
+      agentRoster.map(async (agent) => {
+        try {
+          const jobs = await listCronJobsForAgent(agent, true);
+          return jobs.some((job) => {
+            const id = asString(job?.job_id || job?.id);
+            return id === reference || asString(job?.name) === reference;
+          })
+            ? agent
+            : undefined;
+        } catch {
+          return undefined;
+        }
+      }),
+    );
+    const owners = candidates.filter(Boolean);
+    if (owners.length > 1) {
+      throw new Error(`Ambiguous cron job ownership for "${reference}".`);
+    }
+    const resolved = owners[0];
+    if (!resolved) throw new Error(`Unknown cron job "${reference}".`);
+    cronAgentByJobId.set(reference, resolved);
+    return resolved;
+  };
+
   const requireAgent = (agentId) => {
     const resolved = agentRoster.find((agent) => agent.id === asString(agentId));
     if (!resolved) throw new Error(`Unknown hermes-agent profile "${asString(agentId)}".`);
     return resolved;
+  };
+
+  const cronProfileForAgent = (agent) => asString(agent?.profile) || "default";
+  const hasProfileCronApi = (method) => typeof profileApi?.[method] === "function";
+  const canFallbackToRpc = (err) => {
+    const message = errorMessage(err);
+    return message.includes("ECONNREFUSED") || /HTTP (404|405|426)/.test(message);
+  };
+  const isNamedCronProfile = (agent) => Boolean(asString(agent?.profile));
+  const nativeCronActions = new Set(["list", "add", "remove", "pause", "resume"]);
+
+  const cronResultError = (result, fallback) => {
+    if (!result || typeof result !== "object") return fallback;
+    return (
+      asString(result.error?.message) ||
+      asString(result.error) ||
+      asString(result.detail) ||
+      asString(result.message) ||
+      fallback
+    );
+  };
+
+  // Both adapters are allowed to return the native wrapper ({ jobs: [] }),
+  // while the profile REST helper normally unwraps the JSON array. Treat an
+  // explicit failure as a failure instead of turning it into an empty board.
+  const cronRows = (result, action) => {
+    if (result?.success === false || result?.ok === false) {
+      throw new Error(cronResultError(result, `Hermes Cron ${action} failed.`));
+    }
+    if (Array.isArray(result)) return result;
+    if (Array.isArray(result?.jobs)) return result.jobs;
+    if (result === undefined || result === null) {
+      throw new Error(`Hermes Cron ${action} returned no result.`);
+    }
+    return [];
+  };
+
+  const requireCronSuccess = (result, action) => {
+    if (result?.success === false || result?.ok === false) {
+      throw new Error(cronResultError(result, `Hermes Cron ${action} failed.`));
+    }
+    return result;
+  };
+
+  const filterCronJobs = (jobs, includeDisabled) => {
+    const rows = cronRows(jobs, "list");
+    return includeDisabled ? rows : rows.filter((job) => job?.enabled !== false);
+  };
+
+  const listCronJobsForAgent = async (agent, includeDisabled = true) => {
+    if (hasProfileCronApi("listCronJobs")) {
+      try {
+        const rows = await profileApi.listCronJobs(cronProfileForAgent(agent), includeDisabled);
+        return filterCronJobs(rows, includeDisabled);
+      } catch (err) {
+        // A named profile must never fall through to the launch profile.
+        if (isNamedCronProfile(agent) || !canFallbackToRpc(err)) throw err;
+      }
+    }
+    if (isNamedCronProfile(agent)) {
+      throw new Error(`Profile-scoped Hermes Cron REST API is unavailable for "${cronProfileForAgent(agent)}".`);
+    }
+    const result = await client.request(
+      "cron.manage",
+      toNativeCronParams({ includeDisabled }, agent, "list"),
+    );
+    return filterCronJobs(result, includeDisabled);
+  };
+
+  const validateCronAction = (action, params) => {
+    if (action === "add") {
+      if (!asString(params.name)) throw new Error("Cron job name is required.");
+      toNativeCronSchedule(params.schedule);
+      cronPayloadText(params.payload, true);
+    } else if (action === "update") {
+      if (params.name === undefined && params.schedule === undefined && params.payload === undefined && params.delivery === undefined) {
+        throw new Error("Cron update requires at least one field.");
+      }
+      if (params.schedule !== undefined) toNativeCronSchedule(params.schedule);
+      if (params.payload !== undefined) cronPayloadText(params.payload, true);
+    }
+    if (action !== "list" && action !== "add" && !asString(params.jobId)) {
+      throw new Error("Cron job id is required.");
+    }
+  };
+
+  const runCronAction = async (action, params, agent) => {
+    validateCronAction(action, params);
+    const jobId = asString(params.jobId);
+    const profile = cronProfileForAgent(agent);
+    const restUnavailable = (err) => {
+      if (isNamedCronProfile(agent)) {
+        throw new Error(`Profile-scoped Hermes Cron REST API is unavailable for "${profile}": ${errorMessage(err)}`);
+      }
+      if (!canFallbackToRpc(err)) throw err;
+    };
+
+    if (action === "list" && hasProfileCronApi("listCronJobs")) {
+      return listCronJobsForAgent(agent, params.includeDisabled !== false);
+    }
+    if (action === "add" && hasProfileCronApi("createCronJob")) {
+      try {
+        return requireCronSuccess(await profileApi.createCronJob(profile, {
+          name: asString(params.name),
+          schedule: toNativeCronSchedule(params.schedule),
+          prompt: cronPayloadText(params.payload, true),
+          deliver: toNativeCronDelivery(params.delivery),
+        }), action);
+      } catch (err) {
+        restUnavailable(err);
+      }
+    }
+    if (action === "update" && hasProfileCronApi("updateCronJob")) {
+      const updates = {};
+      if (params.name !== undefined) updates.name = asString(params.name);
+      if (params.schedule !== undefined) updates.schedule = toNativeCronSchedule(params.schedule);
+      if (params.payload !== undefined) updates.prompt = cronPayloadText(params.payload, true);
+      if (params.delivery !== undefined) updates.deliver = toNativeCronDelivery(params.delivery);
+      try {
+        return requireCronSuccess(await profileApi.updateCronJob(profile, jobId, updates), action);
+      } catch (err) {
+        restUnavailable(err);
+      }
+    }
+    if (action === "remove" && hasProfileCronApi("deleteCronJob")) {
+      try {
+        return requireCronSuccess(await profileApi.deleteCronJob(profile, jobId), action);
+      } catch (err) {
+        restUnavailable(err);
+      }
+    }
+    if (action === "pause" && hasProfileCronApi("pauseCronJob")) {
+      try {
+        return requireCronSuccess(await profileApi.pauseCronJob(profile, jobId), action);
+      } catch (err) {
+        restUnavailable(err);
+      }
+    }
+    if (action === "resume" && hasProfileCronApi("resumeCronJob")) {
+      try {
+        return requireCronSuccess(await profileApi.resumeCronJob(profile, jobId), action);
+      } catch (err) {
+        restUnavailable(err);
+      }
+    }
+    if (action === "run" && hasProfileCronApi("triggerCronJob")) {
+      try {
+        return requireCronSuccess(await profileApi.triggerCronJob(profile, jobId), action);
+      } catch (err) {
+        restUnavailable(err);
+      }
+    }
+    if (isNamedCronProfile(agent)) {
+      throw new Error(`Profile-scoped Hermes Cron REST API is unavailable for "${profile}".`);
+    }
+    if (!nativeCronActions.has(action)) {
+      throw new Error(`Native Hermes Cron does not support the "${action}" action.`);
+    }
+    const result = await client.request(
+      "cron.manage",
+      toNativeCronParams(params, agent, action),
+    );
+    return requireCronSuccess(result, action);
   };
 
   const loadRoleFiles = async (agentId) => {
@@ -666,6 +1008,12 @@ function createHermesAgentUpstream(options) {
           "tasks.list",
           "tasks.update",
           "cron.list",
+          "cron.add",
+          "cron.update",
+          "cron.remove",
+          "cron.pause",
+          "cron.resume",
+          "cron.run",
         ],
         events: ["chat", "agent", "presence", "heartbeat", "cron"],
       },
@@ -1036,14 +1384,89 @@ function createHermesAgentUpstream(options) {
       }
 
       case "cron.list": {
+        const requestedAgentId = asString(p.agentId);
+        const agents = requestedAgentId
+          ? [requireAgent(requestedAgentId)]
+          : agentRoster;
         try {
-          // cron.manage reads the launch profile's scheduler, so the jobs
-          // belong to whichever agent that profile maps to.
-          const result = await client.request("cron.manage", { action: "list" });
-          return resOk(id, { jobs: toHermes3dCronJobs(result?.jobs, defaultAgentId) });
+          const perAgent = await Promise.all(
+            agents.map(async (agent) => {
+              const jobs = await listCronJobsForAgent(agent, p.includeDisabled !== false);
+              return toHermes3dCronJobs(jobs, agent.id);
+            }),
+          );
+          const flattened = perAgent.flat();
+          const owners = new Map();
+          for (const job of flattened) {
+            const previous = owners.get(job.id);
+            if (previous && previous !== job.agentId) {
+              throw new Error(`Ambiguous cron job ownership for "${job.id}".`);
+            }
+            if (previous) {
+              throw new Error(`Duplicate cron job id "${job.id}" in agent "${job.agentId}".`);
+            }
+            owners.set(job.id, job.agentId);
+          }
+          cronAgentByJobId.clear();
+          for (const job of flattened) {
+            const owner = agentRoster.find((agent) => agent.id === job.agentId);
+            if (owner) cronAgentByJobId.set(job.id, owner);
+          }
+          return resOk(id, { jobs: flattened });
         } catch (err) {
-          log(`[hermes-agent] cron.manage failed: ${errorMessage(err)}`);
-          return resOk(id, { jobs: [] });
+          return resErr(id, "hermes_agent.cron_list_failed", errorMessage(err));
+        }
+      }
+
+      case "cron.add":
+      case "cron.update":
+      case "cron.remove":
+      case "cron.pause":
+      case "cron.resume":
+      case "cron.run": {
+        try {
+          const agentId = asString(p.agentId);
+          const action = method.slice("cron.".length);
+          const actionParams = {
+            name: p.name,
+            jobId: p.id,
+            schedule: p.schedule,
+            payload: p.payload,
+            delivery: p.delivery,
+            repeat: p.repeat,
+          };
+          validateCronAction(action, actionParams);
+          const agent = await resolveCronAgent(agentId, p.id);
+          const result = await runCronAction(action, actionParams, agent);
+          if (result?.success === false || result?.ok === false) {
+            const semanticError =
+              asString(result?.error?.message) ||
+              asString(result?.error) ||
+              asString(result?.message);
+            throw new Error(semanticError || `Hermes cron ${action} failed.`);
+          }
+          const rawJob = result?.job || (action !== "remove" ? result : undefined);
+          const mappedJob = rawJob
+            ? toHermes3dCronJobs([rawJob], agent.id)[0]
+            : undefined;
+          if (mappedJob?.id) cronAgentByJobId.set(mappedJob.id, agent);
+          if (action === "remove") {
+            cronAgentByJobId.delete(asString(p.id));
+            return resOk(id, { ok: true, removed: true });
+          }
+          if (action === "run") {
+            return resOk(id, { ok: true, ran: true, ...(mappedJob ? { job: mappedJob } : {}) });
+          }
+          if (!mappedJob) {
+            return resErr(
+              id,
+              `hermes_agent.cron_${action}_failed`,
+              `hermes-agent did not return the ${action} cron job.`,
+            );
+          }
+          return resOk(id, mappedJob);
+        } catch (err) {
+          return resErr(id, `hermes_agent.cron_${method.slice("cron.".length)}_failed`, errorMessage(err));
         }
       }
 
@@ -1214,6 +1637,10 @@ module.exports = {
   toHermes3dMessages,
   toHermes3dCronJobs,
   toHermes3dSchedule,
+  toHermes3dDelivery,
+  toNativeCronSchedule,
+  toNativeCronDelivery,
+  toNativeCronParams,
   toHermes3dAgents,
   resolveDefaultAgentId,
   MAIN_SESSION_KEY,
