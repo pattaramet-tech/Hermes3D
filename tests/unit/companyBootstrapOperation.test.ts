@@ -199,6 +199,73 @@ describe("runCompanyBootstrapOperation", () => {
     expect(order).not.toContain("reset");
   });
 
+  it("preserves existing agents and adds company roles when preserveExistingAgents is enabled", async () => {
+    const plan = parseCompanyPlanFromAssistantText(
+      JSON.stringify({
+        companyName: "Additive Office",
+        summary: "Adds a company without replacing the existing Hermes fleet.",
+        sharedRules: [],
+        plannerNotes: [],
+        roles: [
+          {
+            title: "Editor",
+            purpose: "Edits novels.",
+            soul: "Careful.",
+            responsibilities: ["Edit marked tabs"],
+            collaborators: [],
+            tools: [],
+            heartbeat: [],
+            emoji: "✍️",
+            creature: "specialist",
+            vibe: "precise",
+            userContext: "",
+            commandMode: "ask",
+          },
+        ],
+      }),
+    );
+    const deleted: string[] = [];
+    const cleared: string[] = [];
+    const renamed: string[] = [];
+    const created: string[] = [];
+
+    const createdIds = await runCompanyBootstrapOperation({
+      input: { businessDescription: "Add Editor.", improvedBrief: "" },
+      plan,
+      existingAgentIds: ["default", "partner"],
+      preserveExistingAgents: true,
+      deleteExistingAgent: async (agentId) => {
+        deleted.push(agentId);
+      },
+      clearReusedAgentState: async (agentId) => {
+        cleared.push(agentId);
+      },
+      renameAgent: async (agentId, name) => {
+        renamed.push(`${agentId}:${name}`);
+      },
+      createAgent: async (name) => {
+        created.push(name);
+        return { id: "editor" };
+      },
+      writeAgentFiles: async () => {},
+      saveAvatar: () => {},
+      loadAgents: async () => {},
+      findAgentById: (agentId) => ({ agentId, sessionKey: `agent:${agentId}:main` }),
+      resetAgentSession: async () => {},
+      applyPermissions: async () => {},
+      persistSnapshot: () => {},
+      setOfficeTitle: () => {},
+      selectAgent: () => {},
+      setStatusLine: () => {},
+    });
+
+    expect(deleted).toEqual([]);
+    expect(cleared).toEqual([]);
+    expect(renamed).toEqual([]);
+    expect(created).toEqual(["Editor"]);
+    expect(createdIds).toEqual(["editor"]);
+  });
+
   it("reuses main as the first company role instead of deleting it", async () => {
     const plan = parseCompanyPlanFromAssistantText(
       JSON.stringify({

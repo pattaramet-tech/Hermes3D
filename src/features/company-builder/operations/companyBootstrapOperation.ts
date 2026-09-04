@@ -18,6 +18,7 @@ export async function runCompanyBootstrapOperation(params: {
   input: CompanyBuilderInput;
   plan: CompanyBuilderPlan;
   existingAgentIds?: string[];
+  preserveExistingAgents?: boolean;
   deleteExistingAgent?: (agentId: string) => Promise<void>;
   clearReusedAgentState?: (agentId: string) => Promise<void>;
   renameAgent?: (agentId: string, name: string) => Promise<void>;
@@ -43,8 +44,12 @@ export async function runCompanyBootstrapOperation(params: {
 }): Promise<string[]> {
   const blueprints = buildCompanyAgentBlueprints(params.plan);
   const existingAgentIds = params.existingAgentIds ?? [];
-  const reusableAgentId = existingAgentIds.includes("main") && blueprints[0] ? "main" : null;
-  const deletableAgentIds = existingAgentIds.filter((agentId) => agentId !== reusableAgentId);
+  const preserveExistingAgents = params.preserveExistingAgents === true;
+  const reusableAgentId =
+    !preserveExistingAgents && existingAgentIds.includes("main") && blueprints[0] ? "main" : null;
+  const deletableAgentIds = preserveExistingAgents
+    ? []
+    : existingAgentIds.filter((agentId) => agentId !== reusableAgentId);
 
   if (deletableAgentIds.length > 0 && params.deleteExistingAgent) {
     params.setStatusLine(

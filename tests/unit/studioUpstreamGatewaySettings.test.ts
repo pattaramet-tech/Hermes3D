@@ -55,4 +55,54 @@ describe("server studio upstream gateway settings", () => {
     expect(settings.url).toBe("ws://gateway.example:18789");
     expect(settings.token).toBe("tok-local");
   });
+
+  it("uses runtime HERMES3D gateway defaults when studio settings are missing", async () => {
+    tempDir = makeTempDir("studio-upstream-env-defaults");
+    const env = {
+      ...process.env,
+      HERMES_STATE_DIR: tempDir,
+      HERMES3D_GATEWAY_URL: "ws://hermes3d-office-backend:9121",
+      HERMES3D_GATEWAY_TOKEN: "office-token",
+      HERMES3D_GATEWAY_ADAPTER_TYPE: "hermes-agent",
+    };
+
+    const { loadUpstreamGatewaySettings } = await import("../../server/studio-settings");
+    const settings = loadUpstreamGatewaySettings(env);
+    expect(settings.url).toBe("ws://hermes3d-office-backend:9121");
+    expect(settings.token).toBe("office-token");
+    expect(settings.adapterType).toBe("hermes-agent");
+  });
+
+  it("keeps persisted studio gateway fields ahead of runtime env defaults", async () => {
+    tempDir = makeTempDir("studio-upstream-settings-precedence");
+    fs.mkdirSync(path.join(tempDir, "hermes3d"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempDir, "hermes3d", "settings.json"),
+      JSON.stringify(
+        {
+          gateway: {
+            url: "ws://persisted.example:18789",
+            token: "persisted-token",
+            adapterType: "demo",
+          },
+        },
+        null,
+        2
+      ),
+      "utf8"
+    );
+    const env = {
+      ...process.env,
+      HERMES_STATE_DIR: tempDir,
+      HERMES3D_GATEWAY_URL: "ws://env.example:9121",
+      HERMES3D_GATEWAY_TOKEN: "env-token",
+      HERMES3D_GATEWAY_ADAPTER_TYPE: "hermes-agent",
+    };
+
+    const { loadUpstreamGatewaySettings } = await import("../../server/studio-settings");
+    const settings = loadUpstreamGatewaySettings(env);
+    expect(settings.url).toBe("ws://persisted.example:18789");
+    expect(settings.token).toBe("persisted-token");
+    expect(settings.adapterType).toBe("demo");
+  });
 });
